@@ -14,10 +14,10 @@ from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.manifold import TSNE
-from sklearn.metrics import average_precision_score
-from sklearn.metrics import classification_report, precision_recall_curve
-from sklearn.metrics import precision_score, recall_score, f1_score
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import accuracy_score, average_precision_score
+from sklearn.metrics import f1_score, precision_recall_curve
+from sklearn.metrics import precision_score, recall_score
+from sklearn.model_selection import KFold, StratifiedKFold, RandomizedSearchCV
 from sklearn.model_selection import  StratifiedShuffleSplit, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import make_pipeline
@@ -161,9 +161,7 @@ v14_iqr = q75 - q25
 # Compare the metrics (AUPRC)
 
 #%%
-def plot_auprc(clf, X_test, y_test):
-    score = clf.decision_function(X_test)
-    ap_score = average_precision_score(y_test, score)
+def plot_auprc(score, ap_score, X_test, y_test):
     precision, recall, _ = precision_recall_curve(y_test, score)
     
     plt.step(recall, precision, color='b', alpha=0.2, where='post')
@@ -172,3 +170,168 @@ def plot_auprc(clf, X_test, y_test):
     plt.ylabel('Precision')
     plt.title(f'AP score: {ap_score}')
     plt.show()
+    return
+
+#%%
+def prepare_data(df, scalers):
+    df = df.copy() # don't alter the original
+    # if scalers = None then use StandardScaler for all columns
+    # add check for scalers = None
+    for k, v in scalers.items():
+        series = df[k].values.reshape(-1,1)
+        df.loc[:, f'scaled_{k}'] = scalers[k].fit_transform(series)
+        df.drop([k], axis=1, inplace=True)
+
+    X = df.drop('Class', axis=1)
+    y = df.Class
+
+    return (X, y)
+
+def calc_metrics(clf, X_test, y_test):
+    # calculate precision, recall, f1, accuracy
+    # return dictionary
+    y_pred = clf.predict(X_test)
+    if hasattr(clf, 'decision_function'):
+        score = clf.decision_function(X_test)
+    else:
+        score = clf.predict_proba(X_test)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    accuracy = accuracy_score(y_test, y_pred)
+    ap = average_precision_score(y_test, score)
+    metrics = {'precision': precision,
+               'recall': recall,
+               'f1': f1,
+               'accuracy': accuracy,
+               'ap': ap,
+               'score': score}
+    return metrics
+
+def run_raw_analysis(X_train, y_train, X_test, y_test, params, n_iter):
+    #rand_lr = RandomizedSearchCV(LogisticRegression(solver='liblinear'),
+    #                             params, 
+    #                             n_iter=n_iter,
+    #                             cv=3)
+    #rand_lr.fit(X_train, y_train)
+    #lr = rand_lr.best_estimator_
+    lr = LogisticRegression(solver='liblinear').set_params(**params)
+    lr.fit(X_train, y_train)
+    metrics = calc_metrics(lr, X_test, y_test)
+
+    return metrics
+
+def run_under_analysis(X_train, y_train, X_test, y_test, params, n_iter):
+    #rand_lr = RandomizedSearchCV(LogisticRegression(solver='liblinear'),
+    #                             params, 
+    #                             n_iter=n_iter,
+    #                             cv=3)
+    near_miss = NearMiss(sampling_strategy='majority')
+    #under_pipe = imb_make_pipeline(near_miss, rand_lr)
+    #under_model = under_pipe.fit(X_train, y_train)
+    #lr = rand_lr.best_estimator_
+    lr = LogisticRegression(solver='liblinear').set_params(**params)
+    under_pipe = imb_make_pipeline(near_miss, lr)
+    under_model = under_pipe.fit(X_train, y_train)
+    metrics = calc_metrics(lr, X_test, y_test)
+
+    return metrics
+
+def run_over_analysis(X_train, y_train, X_test, y_test, params, n_iter):
+    #rand_lr = RandomizedSearchCV(LogisticRegression(solver='liblinear'),
+    #                             params, 
+    #                             n_iter=n_iter,
+    #                             cv=3)
+    smote = SMOTE(sampling_strategy='minority')
+    #over_pipe = imb_make_pipeline(smote, rand_lr)
+    #over_model = over_pipe.fit(X_train, y_train)
+    #lr = rand_lr.best_estimator_
+    lr = LogisticRegression(solver='liblinear').set_params(**params)
+    over_pipe = imb_make_pipeline(smote, lr)
+    over_model = over_pipe.fit(X_train, y_train)
+    metrics = calc_metrics(lr, X_test, y_test)
+
+    return metrics
+
+#%%
+# read in data
+df = pd.read_csv('data/creditcard.csv')
+
+# set parameters
+n_iter = 10
+lr_params = {'penalty': ['l1', 'l2'],
+             'C': [0.001, 0.01, 0.1, 1, 10, 100, 1000]}
+
+# Robust to handle outliers, standard otherwise
+scalers = {'Amount': RobustScaler(),
+           'Time': StandardScaler()}
+X, y = prepare_data(df, scalers)
+X = X.drop('scaled_Time', axis=1)
+
+# RandomSearchCV on full data to get rough parameters
+rand_lr = RandomizedSearchCV(LogisticRegression(solver='liblinear'),
+                             lr_params,
+                             n_iter=n_iter,
+                             cv=3)
+rand_lr.fit(X, y)
+best_params = rand_lr.best_params_
+
+# SKF to create train test
+# Loop over another SKF to split train into train val
+
+#%%
+skf = StratifiedKFold(n_splits=3, random_state=0, shuffle=False)
+raws = []
+unders = []
+overs = []
+for train_idx, test_idx in skf.split(X, y):
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    X_train = X_train.values
+    X_test = X_test.values
+    y_train = y_train.values
+    y_test = y_test.values
+
+    print('Raw')
+    metrics_raw = run_raw_analysis(X_train, y_train,
+                                   X_test, y_test,
+                                   best_params, n_iter)
+                                   #lr_params, n_iter)
+    print(metrics_raw)
+    raws.append(metrics_raw['ap'])
+    plot_auprc(metrics_raw['score'], metrics_raw['ap'], X_test, y_test)
+
+    print('Under')
+    metrics_under = run_under_analysis(X_train, y_train,
+                                       X_test, y_test,
+                                       best_params, n_iter)
+                                       #lr_params, n_iter)
+    print(metrics_under)
+    unders.append(metrics_under['ap'])
+    plot_auprc(metrics_under['score'], metrics_under['ap'], X_test, y_test)
+
+    print('Over')
+    metrics_over = run_over_analysis(X_train, y_train,
+                                     X_test, y_test, 
+                                     best_params, n_iter)
+                                     #lr_params, n_iter)
+    print(metrics_over)
+    overs.append(metrics_over['ap'])
+    plot_auprc(metrics_over['score'], metrics_over['ap'], X_test, y_test)
+
+
+#%%
+print(f'Raw avg: {np.mean(raws)}')
+print(f'Under avg: {np.mean(unders)}')
+print(f'Over avg: {np.mean(overs)}')
+
+#%%
+# The plots from the train/test loop shows that undersampling does not perform
+# well at all. Interestingly enough, the oversampled average is about the same
+# as the raw data. There must be more to do
+
+# Remove extreme outliers for under- and over-sampled data
+# Is Time useful? It's the time from the first transaction. Since the other
+# features are numerical, I don't see how they can contain info like "ID 1 
+# spent X at this time and Y at this time which are too far apart."
